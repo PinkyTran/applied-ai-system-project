@@ -1,0 +1,86 @@
+classDiagram
+    %% PawPal+ — priority + time-budget scheduler (FINAL, matches pawpal_system.py).
+    %% An Owner cares for one or more Pets; each Pet owns its care Tasks.
+    %% The Scheduler collects every (pet, task) across the owner's pets,
+    %% ranks by priority (then duration), fits them into the owner's time
+    %% budget, skips the rest, and produces a DailyPlan of PlanItems that can
+    %% explain every decision. It also sorts tasks chronologically and flags
+    %% time conflicts. ($ marks static methods.)
+
+    class Priority {
+        <<enumeration>>
+        HIGH
+        MEDIUM
+        LOW
+    }
+
+    class Owner {
+        +str name
+        +int available_minutes
+        +list~str~ preferences
+        +list~Pet~ pets
+        +add_pet(pet) void
+        +filter_tasks(status, pet_name) list
+    }
+
+    class Pet {
+        +str name
+        +str species
+        +str breed
+        +str color
+        +int age
+        +list~Task~ tasks
+        +add_task(task) void
+        +complete_task(task) Task
+    }
+
+    class Task {
+        +str title
+        +int duration_minutes
+        +Priority priority
+        +str category
+        +str time
+        +str frequency
+        +date due_date
+        +str status
+        +rank() int
+        +mark_complete() void
+        +update(title, duration_minutes, priority, time, frequency, category) void
+        +next_occurrence() Task
+    }
+
+    class PlanItem {
+        +Task task
+        +Pet pet
+        +str start_time
+        +bool included
+        +str reason
+    }
+
+    class DailyPlan {
+        +Owner owner
+        +list~PlanItem~ items
+        +list~PlanItem~ skipped
+        +int total_minutes
+        +explain() str
+    }
+
+    class Scheduler {
+        +int start_hour
+        +build_plan(owner) DailyPlan
+        +sort_by_time(tasks) list$
+        +detect_conflicts(owner) list
+        -collect_tasks(owner) list
+        -sort_tasks(pet_tasks) list
+        -format_time(minutes) str$
+    }
+
+    Owner "1" *-- "*" Pet : cares for
+    Pet "1" *-- "*" Task : needs
+    Task --> Priority : has
+    Scheduler ..> Owner : reads pets & budget
+    Scheduler --> DailyPlan : creates
+    Scheduler ..> PlanItem : creates
+    DailyPlan "1" *-- "*" PlanItem : contains
+    PlanItem "1" --> "1" Task : wraps
+    PlanItem "1" --> "1" Pet : for
