@@ -1,36 +1,137 @@
-%% System Architecture — Applied AI System Project
-%% Edit the nodes/labels below to match your actual system.
-%% Preview: https://mermaid.live  (paste this file's contents, then export PNG to ../assets/)
+%% System Architecture — PawPal+ (Applied AI System Project)
+%% AI feature: Retrieval-Augmented Generation (RAG)
+%% Preview: https://mermaid.live  (paste this file's contents)
+%%
+%% Read the flow top to bottom:
+%%   INPUT     pet profile + owner's time budget
+%%   RETRIEVE  care guidance for THIS pet (deterministic, offline)
+%%   GENERATE  tasks grounded in the retrieved sources only
+%%   VERIFY    automated guardrails, then a human accept/reject step
+%%   SCHEDULE  the unchanged domain logic
+%%   OUTPUT    daily plan + explanation of every decision
+%%
+%% AI results are checked in three places, labelled CHECK A/B/C below:
+%%   CHECK A  _validate() guardrails - automated, every run, blocks bad output
+%%   CHECK B  Human review in the UI - owner ticks/unticks before anything is kept
+%%   CHECK C  pytest suite           - 132 offline tests (fake API client + local Ollama backend)
 
 flowchart TD
-    User([User])
 
-    subgraph Client["Client Layer"]
-        UI[Web UI / CLI]
+    Owner(["Pet owner"])
+
+    %% ---------------- 1. INPUT ----------------
+    subgraph Input["1 - INPUT · Streamlit UI · app.py"]
+        Profile["Pet profile<br/>species · breed · age"]
+        Budget["Time budget<br/>available_minutes"]
     end
 
-    subgraph Backend["Application Layer"]
-        API[API Server]
-        Orchestrator[Agent / Orchestration Logic]
+    %% ---------------- 2. RETRIEVAL ----------------
+    subgraph Retrieval["2 - RETRIEVER · retriever.py · deterministic, no network"]
+        Query["build_query()<br/>species x4 · breed x2 · life stage"]
+        Index["KnowledgeBase<br/>TF-IDF index"]
+        KB[("knowledge/<br/>14 markdown chunks")]
+        TopK["Top-4 chunks<br/>each with a source id"]
     end
 
-    subgraph AI["AI Layer"]
-        LLM[Claude API<br/>claude-opus-5]
-        Tools[Tools / Function Calling]
+    %% ---------------- 3. GENERATION ----------------
+    subgraph Generation["3 - GENERATOR · pawpal_ai.py"]
+        Prompt["build_user_prompt()<br/>profile + budget + retrieved sources"]
+        Pick{"PAWPAL_PROVIDER<br/>which backend?"}
+        Local["Ollama · local model<br/>free · no API key · offline"]
+        Cloud["Anthropic API · claude-opus-5<br/>paid · faster"]
+        Proposed["ProposedTask list<br/>each must cite a source id"]
     end
 
-    subgraph Data["Data Layer"]
-        VectorDB[(Vector Store)]
-        DB[(Database)]
+    %% ---------------- 4. VERIFICATION ----------------
+    subgraph Verify["4 - VERIFICATION · where AI output gets checked"]
+        Guard["CHECK A · _validate() guardrails"]
+        Ground{"Is the cited source id<br/>one we actually retrieved?"}
+        Bounds{"duration 1-240 · valid enums<br/>no duplicates · max 8 tasks"}
+        Infer["infer_time_of_day()<br/>blank time -> guess from title,<br/>e.g. 'Evening walk' -> late in the window"]
+        Reject["Rejected and logged<br/>reason shown in the UI"]
+        Review["CHECK B · Human review<br/>owner ticks or unticks each task"]
     end
 
-    User --> UI
-    UI --> API
-    API --> Orchestrator
-    Orchestrator --> LLM
-    Orchestrator --> Tools
-    Orchestrator --> VectorDB
-    Orchestrator --> DB
-    LLM --> Orchestrator
-    Orchestrator --> API
-    API --> UI
+    %% ---------------- 5. DOMAIN ----------------
+    subgraph Domain["5 - SCHEDULER · pawpal_system.py · deterministic, no AI"]
+        Accepted["Validated Task objects"]
+        Sched["Scheduler.build_plan() — two phases:<br/>1 what: rank by priority, fit the budget<br/>2 when: anchor timed tasks, fill gaps<br/>within owner.day_start .. day_end"]
+    end
+
+    %% ---------------- 6. OUTPUT ----------------
+    subgraph Output["6 - OUTPUT"]
+        Plan["DailyPlan<br/>scheduled · skipped · reason for each"]
+    end
+
+    %% ---------------- CROSS-CUTTING ----------------
+    subgraph Observe["Observability"]
+        Log[("pawpal.log<br/>retrieval scores · accept and reject · tokens")]
+    end
+
+    subgraph Testing["CHECK C · TESTING · pytest · 132 tests, all offline"]
+        Fake["FakeClient<br/>replaces the Claude API"]
+        TestRag["tests/test_rag.py · 90 tests<br/>retrieval, guardrails, time inference, both backends"]
+        TestDom["tests/test_pawpal.py · 42 tests<br/>scheduling behaviour, incl. the availability window"]
+    end
+
+    %% ---------------- MAIN DATA FLOW ----------------
+    Owner --> Profile
+    Owner --> Budget
+    Profile --> Query
+    Budget --> Query
+    KB --> Index
+    Query --> Index
+    Index --> TopK
+
+    TopK --> Prompt
+    Profile --> Prompt
+    Budget --> Prompt
+    Prompt --> Pick
+    Pick -->|ollama| Local
+    Pick -->|anthropic| Cloud
+    Local --> Proposed
+    Cloud --> Proposed
+
+    Proposed --> Guard
+    Guard --> Ground
+    Ground -->|ungrounded| Reject
+    Ground -->|grounded| Bounds
+    Bounds -->|fails a rule| Reject
+    Bounds -->|passes| Infer
+    Infer --> Review
+
+    Review -->|kept| Accepted
+    Review -->|unticked| Discard["Discarded"]
+    Accepted --> Sched
+    Sched --> Plan
+    Plan --> Owner
+    Reject --> Owner
+
+    %% the grounding check compares against what retrieval actually returned
+    TopK -.->|allowed source ids| Ground
+
+    %% observability
+    Index -.->|logs| Log
+    Guard -.->|logs| Log
+    Local -.->|token usage| Log
+    Cloud -.->|token usage| Log
+
+    %% test coverage
+    Fake --> TestRag
+    TestRag -.->|verifies| Index
+    TestRag -.->|verifies| Guard
+    TestDom -.->|verifies| Sched
+
+    %% ---------------- STYLING ----------------
+    classDef human fill:#fde68a,stroke:#b45309,stroke-width:2px,color:#1c1917
+    classDef ai fill:#ddd6fe,stroke:#6d28d9,stroke-width:2px,color:#1c1917
+    classDef check fill:#bbf7d0,stroke:#15803d,stroke-width:2px,color:#1c1917
+    classDef bad fill:#fecaca,stroke:#b91c1c,stroke-width:2px,color:#1c1917
+    classDef store fill:#e0f2fe,stroke:#0369a1,stroke-width:2px,color:#1c1917
+
+    class Owner,Review human
+    class Local,Cloud,Proposed ai
+    class Pick check
+    class Guard,Ground,Bounds,Infer,TestRag,TestDom,Fake check
+    class Reject,Discard bad
+    class KB,Log store

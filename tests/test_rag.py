@@ -7,7 +7,10 @@ suite runs offline and for free.
 
 from __future__ import annotations
 
+import io
+import json
 import sys
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -433,12 +436,35 @@ def test_refusal_raises_a_friendly_error(kb, owner):
         suggest_tasks(pet, owner, kb=kb, client=client)
 
 
-def test_missing_api_key_raises_before_calling_the_api(kb, owner, monkeypatch):
+def test_missing_api_key_on_the_anthropic_path_raises(kb, owner, monkeypatch):
+    # Explicitly asking for the paid backend without a key must fail fast,
+    # before any request is made.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     pet = Pet(name="Biscuit", species="dog", age=4)
     owner.add_pet(pet)
     with pytest.raises(PawPalAIError, match="ANTHROPIC_API_KEY"):
-        suggest_tasks(pet, owner, kb=kb)  # no client injected
+        suggest_tasks(pet, owner, kb=kb, provider="anthropic")
+
+
+def test_missing_api_key_falls_back_to_the_free_local_backend(kb, owner, monkeypatch):
+    # With no key and no explicit provider, the app must route to Ollama rather
+    # than erroring — this is what makes it runnable with no account at all.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("PAWPAL_PROVIDER", raising=False)
+    called = {}
+
+    def fake_ollama(system, user, model):
+        called["model"] = model
+        return CarePlanSuggestion(tasks=[], coverage_note="local"), 1, 2
+
+    monkeypatch.setattr(pawpal_ai, "_generate_ollama", fake_ollama)
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+
+    result = suggest_tasks(pet, owner, kb=kb)
+
+    assert result.provider == "ollama"
+    assert called["model"] == pawpal_ai.DEFAULT_OLLAMA_MODEL
 
 
 def test_no_retrieval_hits_returns_empty_without_calling_the_api(kb, owner, monkeypatch):
@@ -453,6 +479,354 @@ def test_no_retrieval_hits_returns_empty_without_calling_the_api(kb, owner, monk
     assert isinstance(result, SuggestionResult)
     assert result.suggestions == []
     assert "No care guidance matched" in result.coverage_note
+
+
+# --- availability window scheduling ---------------------------------------
+
+
+def window_owner(minutes=200, start="07:00", end="20:00") -> Owner:
+    """An owner with an explicit availability window and one pet."""
+    owner = Owner(name="Jordan", available_minutes=minutes, day_start=start, day_end=end)
+    owner.add_pet(Pet(name="Biscuit", species="dog"))
+    return owner
+
+
+def test_timed_task_keeps_its_preferred_time():
+    owner = window_owner()
+    owner.pets[0].add_task(Task("Evening walk", 30, Priority.MEDIUM, time="18:00"))
+    plan = Scheduler().build_plan(owner)
+    assert plan.items[0].start_time == "18:00"
+
+
+def test_untimed_tasks_fill_gaps_without_moving_anchors():
+    # The bug this guards: placing a high-priority evening task first used to
+    # push the entire rest of the routine into the evening behind it.
+    owner = window_owner()
+    pet = owner.pets[0]
+    pet.add_task(Task("Evening walk", 30, Priority.HIGH, time="18:00"))
+    pet.add_task(Task("Brush coat", 10, Priority.LOW))
+    plan = Scheduler().build_plan(owner)
+    by_title = {i.task.title: i.start_time for i in plan.items}
+    assert by_title["Evening walk"] == "18:00"
+    assert by_title["Brush coat"] == "07:00"  # start of the window, not 18:30
+
+
+def test_tasks_never_start_before_the_window_opens():
+    owner = window_owner(start="09:00")
+    owner.pets[0].add_task(Task("Brush coat", 10, Priority.LOW))
+    plan = Scheduler().build_plan(owner)
+    assert plan.items[0].start_time == "09:00"
+
+
+def test_task_finishing_after_the_window_is_skipped():
+    owner = window_owner(minutes=500, end="20:00")
+    owner.pets[0].add_task(Task("Late stroll", 45, Priority.HIGH, time="19:45"))
+    plan = Scheduler().build_plan(owner)
+    assert plan.items == []
+    assert "before 20:00" in plan.skipped[0].reason
+
+
+def test_untimed_task_too_big_for_the_window_is_skipped():
+    owner = window_owner(minutes=900, start="07:00", end="08:00")
+    owner.pets[0].add_task(Task("Marathon", 120, Priority.LOW))
+    plan = Scheduler().build_plan(owner)
+    assert plan.items == []
+    assert "no free 120 min slot" in plan.skipped[0].reason
+
+
+def test_overlapping_preferred_times_are_pushed_later():
+    owner = window_owner()
+    pet = owner.pets[0]
+    pet.add_task(Task("Meal", 30, Priority.HIGH, time="08:00"))
+    pet.add_task(Task("Walk", 30, Priority.MEDIUM, time="08:00"))  # clashes
+    plan = Scheduler().build_plan(owner)
+    starts = sorted(i.start_time for i in plan.items)
+    assert starts == ["08:00", "08:30"]  # second one moved, not dropped
+    assert any("moved from 08:00" in i.reason for i in plan.items)
+
+
+def test_budget_and_window_are_independent_limits():
+    # A wide window does not grant more hands-on minutes.
+    owner = window_owner(minutes=20, start="06:00", end="23:00")
+    pet = owner.pets[0]
+    pet.add_task(Task("Walk", 15, Priority.HIGH))
+    pet.add_task(Task("Groom", 15, Priority.LOW))
+    plan = Scheduler().build_plan(owner)
+    assert plan.total_minutes == 15
+    assert [s.task.title for s in plan.skipped] == ["Groom"]
+
+
+def test_items_come_back_in_chronological_order():
+    owner = window_owner()
+    pet = owner.pets[0]
+    pet.add_task(Task("Evening", 10, Priority.LOW, time="19:00"))
+    pet.add_task(Task("Morning", 10, Priority.HIGH, time="08:00"))
+    pet.add_task(Task("Midday", 10, Priority.MEDIUM, time="12:00"))
+    plan = Scheduler().build_plan(owner)
+    starts = [i.start_time for i in plan.items]
+    assert starts == sorted(starts)
+
+
+def test_reversed_window_is_ignored_rather_than_fatal():
+    owner = window_owner(start="20:00", end="06:00")
+    owner.pets[0].add_task(Task("Walk", 10, Priority.HIGH))
+    plan = Scheduler().build_plan(owner)  # must not raise or return nothing
+    assert len(plan.items) == 1
+
+
+def test_owner_without_a_window_keeps_the_old_behaviour():
+    owner = Owner(name="Jordan", available_minutes=100)
+    owner.add_pet(Pet(name="Biscuit", species="dog"))
+    owner.pets[0].add_task(Task("A", 10, Priority.HIGH))
+    owner.pets[0].add_task(Task("B", 20, Priority.LOW))
+    plan = Scheduler(start_hour=8).build_plan(owner)
+    assert [i.start_time for i in plan.items] == ["08:00", "08:10"]
+
+
+def test_window_reaches_the_model_prompt(kb):
+    owner = window_owner(start="06:30", end="19:15")
+    prompt = build_user_prompt(owner.pets[0], owner, kb.search("dog walking", top_k=2))
+    assert "06:30" in prompt and "19:15" in prompt
+
+
+# --- model backend selection ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key, expected",
+    [
+        ("sk-ant-" + "x" * 90, True),      # looks like a real key
+        ("sk-ant-...", False),             # the unedited .env.example placeholder
+        ("", False),
+        ("not-a-key", False),
+        ('"sk-ant-' + "x" * 90 + '"', True),  # quoted in .env
+    ],
+)
+def test_has_usable_api_key(monkeypatch, key, expected):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", key)
+    assert pawpal_ai.has_usable_api_key() is expected
+
+
+def test_provider_defaults_to_ollama_without_a_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("PAWPAL_PROVIDER", raising=False)
+    assert pawpal_ai.resolve_provider() == "ollama"
+
+
+def test_placeholder_key_still_routes_to_ollama(monkeypatch):
+    # The trap this guards: the placeholder is non-empty, so a naive check
+    # would send the user to the paid backend and fail with a 401.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-...")
+    monkeypatch.delenv("PAWPAL_PROVIDER", raising=False)
+    assert pawpal_ai.resolve_provider() == "ollama"
+
+
+def test_real_key_routes_to_anthropic(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-" + "x" * 90)
+    monkeypatch.delenv("PAWPAL_PROVIDER", raising=False)
+    assert pawpal_ai.resolve_provider() == "anthropic"
+
+
+def test_explicit_provider_overrides_the_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-" + "x" * 90)
+    monkeypatch.setenv("PAWPAL_PROVIDER", "ollama")
+    assert pawpal_ai.resolve_provider() == "ollama"
+
+
+def test_unknown_provider_falls_back_to_autodetect(monkeypatch):
+    monkeypatch.setenv("PAWPAL_PROVIDER", "banana")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert pawpal_ai.resolve_provider() == "ollama"
+
+
+def test_model_defaults_per_provider(monkeypatch):
+    monkeypatch.delenv("PAWPAL_MODEL", raising=False)
+    assert pawpal_ai.resolve_model("ollama") == pawpal_ai.DEFAULT_OLLAMA_MODEL
+    assert pawpal_ai.resolve_model("anthropic") == pawpal_ai.DEFAULT_ANTHROPIC_MODEL
+
+
+def test_model_env_override_wins(monkeypatch):
+    monkeypatch.setenv("PAWPAL_MODEL", "qwen2.5:7b")
+    assert pawpal_ai.resolve_model("ollama") == "qwen2.5:7b"
+
+
+# --- time-of-day inference (fallback for models that skip the time field) --
+
+
+def test_infer_time_of_day_recognises_evening():
+    owner = window_owner(start="07:00", end="21:00")
+    result = pawpal_ai.infer_time_of_day("Evening walk", "", owner)
+    assert result != ""
+    hour = int(result.split(":")[0])
+    assert hour >= 16  # solidly in the back half of the window
+
+
+def test_infer_time_of_day_recognises_morning():
+    owner = window_owner(start="07:00", end="21:00")
+    result = pawpal_ai.infer_time_of_day("Morning meal", "", owner)
+    hour = int(result.split(":")[0])
+    assert hour <= 9  # solidly in the front of the window
+
+
+def test_infer_time_of_day_checks_category_too():
+    # Some proposals put the time-of-day word in the category, not the title.
+    owner = window_owner(start="07:00", end="21:00")
+    assert pawpal_ai.infer_time_of_day("Feed", "evening meal", owner) != ""
+
+
+def test_infer_time_of_day_no_hint_returns_empty():
+    owner = window_owner(start="07:00", end="21:00")
+    assert pawpal_ai.infer_time_of_day("Brush coat", "grooming", owner) == ""
+
+
+def test_infer_time_of_day_without_a_window_returns_empty():
+    owner = Owner(name="Jordan", available_minutes=100)  # no day_start/day_end
+    assert pawpal_ai.infer_time_of_day("Evening walk", "", owner) == ""
+
+
+def test_infer_time_of_day_is_within_the_window():
+    owner = window_owner(start="09:00", end="17:00")
+    for title in ("Morning meal", "Midday walk", "Evening brush", "Bedtime check"):
+        result = pawpal_ai.infer_time_of_day(title, "", owner)
+        minutes = Scheduler.parse_time(result)
+        assert Scheduler.parse_time("09:00") <= minutes <= Scheduler.parse_time("17:00")
+
+
+def test_validate_fills_a_blank_time_from_the_title(kb):
+    owner = window_owner(start="07:00", end="21:00")
+    proposal = make_proposal(title="Evening walk", time="", source_id="dog-walking")
+    accepted, rejected = _validate(
+        [proposal], allowed(kb, "dog-walking"), set(), owner=owner
+    )
+    assert rejected == []
+    assert accepted[0].task.time != ""
+    assert int(accepted[0].task.time.split(":")[0]) >= 16
+
+
+def test_validate_without_owner_leaves_blank_time_blank(kb):
+    # No owner means no window to place a guess in — this must not crash.
+    proposal = make_proposal(title="Evening walk", time="", source_id="dog-walking")
+    accepted, _ = _validate([proposal], allowed(kb, "dog-walking"), set())
+    assert accepted[0].task.time == ""
+
+
+def test_validate_does_not_override_a_time_the_model_did_provide(kb):
+    owner = window_owner(start="07:00", end="21:00")
+    proposal = make_proposal(title="Evening walk", time="08:00", source_id="dog-walking")
+    accepted, _ = _validate([proposal], allowed(kb, "dog-walking"), set(), owner=owner)
+    assert accepted[0].task.time == "08:00"  # model's explicit time wins
+
+
+def test_end_to_end_evening_task_lands_in_the_evening(kb, owner):
+    """The whole point of the fallback, exercised through suggest_tasks()."""
+    owner.day_start, owner.day_end = "07:00", "21:00"
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    suggestion = CarePlanSuggestion(
+        tasks=[
+            make_proposal(title="Morning walk", time="", duration_minutes=20),
+            make_proposal(title="Evening walk", time="", duration_minutes=20),
+        ],
+        coverage_note="",
+    )
+    result = suggest_tasks(pet, owner, kb=kb, client=FakeClient(suggestion))
+    by_title = {s.task.title: s.task.time for s in result.suggestions}
+    assert Scheduler.parse_time(by_title["Evening walk"]) > Scheduler.parse_time(
+        by_title["Morning walk"]
+    )
+
+
+# --- ollama backend (no server needed) ------------------------------------
+
+
+def fake_ollama_response(payload: dict):
+    """Build a stand-in for the object urllib.request.urlopen returns."""
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    return FakeResponse()
+
+
+def test_ollama_backend_parses_a_valid_reply(monkeypatch):
+    reply = {
+        "message": {
+            "content": CarePlanSuggestion(
+                tasks=[make_proposal()], coverage_note="all good"
+            ).model_dump_json()
+        },
+        "prompt_eval_count": 1189,
+        "eval_count": 436,
+    }
+    monkeypatch.setattr(
+        pawpal_ai.urllib.request, "urlopen", lambda *a, **k: fake_ollama_response(reply)
+    )
+    parsed, tin, tout = pawpal_ai._generate_ollama("sys", "user", "llama3.2:3b")
+    assert parsed.tasks[0].title == "Morning walk"
+    assert (tin, tout) == (1189, 436)
+
+
+def test_ollama_offline_gives_a_startup_hint(monkeypatch):
+    def boom(*a, **k):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(pawpal_ai.urllib.request, "urlopen", boom)
+    with pytest.raises(PawPalAIError, match="ollama serve"):
+        pawpal_ai._generate_ollama("sys", "user", "llama3.2:3b")
+
+
+def test_ollama_missing_model_tells_you_to_pull_it(monkeypatch):
+    def boom(*a, **k):
+        raise urllib.error.HTTPError("url", 404, "not found", {}, io.BytesIO(b"no model"))
+
+    monkeypatch.setattr(pawpal_ai.urllib.request, "urlopen", boom)
+    with pytest.raises(PawPalAIError, match="ollama pull"):
+        pawpal_ai._generate_ollama("sys", "user", "llama3.2:3b")
+
+
+def test_ollama_malformed_json_is_a_friendly_error(monkeypatch):
+    # Small local models sometimes drift off-schema; that must not crash.
+    reply = {"message": {"content": '{"tasks": "not a list"}'}}
+    monkeypatch.setattr(
+        pawpal_ai.urllib.request, "urlopen", lambda *a, **k: fake_ollama_response(reply)
+    )
+    with pytest.raises(PawPalAIError, match="didn't match the expected"):
+        pawpal_ai._generate_ollama("sys", "user", "llama3.2:3b")
+
+
+def test_ollama_path_runs_the_same_guardrails(kb, owner, monkeypatch):
+    """The point of the backend split: guardrails are provider-agnostic."""
+    reply = {
+        "message": {
+            "content": CarePlanSuggestion(
+                tasks=[
+                    make_proposal(title="Morning walk", source_id="dog-walking"),
+                    make_proposal(title="Bogus", source_id="invented-source"),
+                ],
+                coverage_note="",
+            ).model_dump_json()
+        },
+        "prompt_eval_count": 10,
+        "eval_count": 20,
+    }
+    monkeypatch.setattr(
+        pawpal_ai.urllib.request, "urlopen", lambda *a, **k: fake_ollama_response(reply)
+    )
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+
+    result = suggest_tasks(pet, owner, kb=kb, provider="ollama")
+
+    assert [s.task.title for s in result.suggestions] == ["Morning walk"]
+    assert len(result.rejected) == 1
+    assert result.provider == "ollama"
 
 
 def test_api_error_becomes_a_user_safe_message(kb, owner, monkeypatch):

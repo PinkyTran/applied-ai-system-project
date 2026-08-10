@@ -2,7 +2,13 @@ from datetime import time as dtime
 
 import streamlit as st
 
-from pawpal_ai import PawPalAIError, setup_logging, suggest_tasks
+from pawpal_ai import (
+    PawPalAIError,
+    resolve_model,
+    resolve_provider,
+    setup_logging,
+    suggest_tasks,
+)
 from pawpal_system import Owner, Pet, Priority, Scheduler, Task
 from retriever import KnowledgeBase, build_query
 
@@ -40,16 +46,42 @@ owner = st.session_state.owner  # the persisted instance we mutate below
 
 # --- owner + constraints ---------------------------------------------------
 st.subheader("1. Owner & time budget")
-col_a, col_b, col_c = st.columns(3)
+col_a, col_b = st.columns(2)
 with col_a:
     owner.name = st.text_input("Owner name", value=owner.name)
 with col_b:
     owner.available_minutes = st.number_input(
-        "Time available today (min)", min_value=0, max_value=1440,
+        "Hands-on time today (min)", min_value=0, max_value=1440,
         value=owner.available_minutes, step=5,
+        help="Minutes you can actually spend on tasks — not the length of your day.",
     )
+
+# The window and the budget are different limits and both apply: you might be
+# around from 07:00 to 21:00 but only have 90 minutes to give.
+col_c, col_d = st.columns(2)
 with col_c:
-    start_hour = st.number_input("Start hour", min_value=0, max_value=23, value=8)
+    day_start_val = st.time_input(
+        "I'm free from", value=dtime(*map(int, (owner.day_start or "07:00").split(":")))
+    )
+with col_d:
+    day_end_val = st.time_input(
+        "until", value=dtime(*map(int, (owner.day_end or "21:00").split(":")))
+    )
+owner.day_start = day_start_val.strftime("%H:%M")
+owner.day_end = day_end_val.strftime("%H:%M")
+
+if owner.day_end <= owner.day_start:
+    st.warning("Your end time is not after your start time — the cutoff will be ignored.")
+else:
+    span = (
+        dtime(*map(int, owner.day_end.split(":"))).hour * 60
+        + dtime(*map(int, owner.day_end.split(":"))).minute
+        - (day_start_val.hour * 60 + day_start_val.minute)
+    )
+    st.caption(
+        f"Window {owner.day_start}–{owner.day_end} ({span // 60}h {span % 60}m), "
+        f"of which {owner.available_minutes} min is hands-on time."
+    )
 
 st.divider()
 
@@ -232,6 +264,15 @@ if owner.pets:
 
     kb = load_knowledge_base()
 
+    # Make the active backend visible: the same pipeline runs against a free
+    # local model or the Anthropic API, and it should be obvious which is live.
+    _provider = resolve_provider()
+    _model = resolve_model(_provider)
+    if _provider == "ollama":
+        st.caption(f"🖥️ Running locally via Ollama — model `{_model}` · free, no API key")
+    else:
+        st.caption(f"☁️ Running on the Anthropic API — model `{_model}`")
+
     ai_col1, ai_col2 = st.columns([2, 1])
     with ai_col1:
         ai_pet_name = st.selectbox(
@@ -300,8 +341,10 @@ if owner.pets:
                     st.toast(f"Added {added} task(s) to {ai_pet.name}.")
                     st.rerun()
 
+            cost = "free (local model)" if result.provider == "ollama" else "billed to your API key"
             st.caption(
-                f"Tokens used: {result.input_tokens} in / {result.output_tokens} out"
+                f"{result.provider}/{result.model} · "
+                f"tokens {result.input_tokens} in / {result.output_tokens} out · {cost}"
             )
         elif not result.rejected:
             st.caption("No tasks suggested for this pet.")
@@ -343,11 +386,17 @@ st.divider()
 
 # --- generate the plan -----------------------------------------------------
 st.subheader("6. Today's plan")
-st.caption("Tasks are scheduled highest-priority first and packed into your time budget.")
+st.caption(
+    "Two steps: **what** to do is chosen by priority until your time budget runs "
+    "out, then **when** to do it is placed across your availability window — "
+    "tasks with a preferred time keep their slot, and the rest fill the gaps."
+)
 
 if st.button("Generate schedule", type="primary", disabled=not owner.pets):
     # The Owner already holds everything the scheduler needs.
-    plan = Scheduler(start_hour=int(start_hour)).build_plan(owner)
+    # The owner's day_start/day_end window drives placement now, so the
+    # Scheduler's own start_hour is only a fallback when no window is set.
+    plan = Scheduler().build_plan(owner)
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Time used", f"{plan.total_minutes} min")

@@ -27,12 +27,32 @@ class Owner:
         available_minutes: int,
         preferences: list[str] | None = None,
         pets: list[Pet] | None = None,
+        day_start: str | None = None,
+        day_end: str | None = None,
     ):
-        """Create an owner with a daily time budget, preferences, and pets."""
+        """Create an owner with a daily time budget, preferences, and pets.
+
+        Args:
+            name: the owner's name.
+            available_minutes: hands-on minutes available today. This is time
+                actually spent on tasks, not the length of the day.
+            preferences: free-text preferences.
+            pets: the pets being cared for.
+            day_start: earliest "HH:MM" a task may begin, e.g. "07:00". None
+                means the Scheduler's own start_hour is used instead.
+            day_end: latest "HH:MM" a task may finish, e.g. "21:00". None means
+                no evening cutoff.
+
+        The window (day_start..day_end) and the budget are different limits and
+        both apply: an owner may be around from 07:00 to 21:00 but only have
+        90 minutes of actual time to give.
+        """
         self.name = name
         self.available_minutes = available_minutes
         self.preferences = preferences if preferences is not None else []
         self.pets = pets if pets is not None else []
+        self.day_start = day_start
+        self.day_end = day_end
 
     def add_pet(self, pet: Pet) -> None:
         """Add a pet for this owner to care for."""
@@ -300,26 +320,24 @@ class Scheduler:
         ]
         ranked = self._sort_tasks(eligible)
 
+        window_start = (
+            self.parse_time(owner.day_start)
+            if owner.day_start
+            else self.start_hour * 60
+        )
+        window_end = self.parse_time(owner.day_end) if owner.day_end else 24 * 60
+        if window_end <= window_start:
+            window_end = 24 * 60  # a nonsensical window is ignored, not fatal
+
+        # --- phase 1: choose WHAT to do, by priority, under the time budget ---
         remaining = owner.available_minutes
-        cursor = self.start_hour * 60  # minutes since midnight
-        items: list[PlanItem] = []
+        selected: list[tuple[Pet, Task]] = []
         skipped: list[PlanItem] = []
-        used = 0
 
         for pet, task in ranked:
             if task.duration_minutes <= remaining:
-                items.append(
-                    PlanItem(
-                        task=task,
-                        pet=pet,
-                        start_time=self._format_time(cursor),
-                        included=True,
-                        reason=f"{task.priority.value} priority, fits the remaining time",
-                    )
-                )
-                cursor += task.duration_minutes
+                selected.append((pet, task))
                 remaining -= task.duration_minutes
-                used += task.duration_minutes
             else:
                 skipped.append(
                     PlanItem(
@@ -331,7 +349,108 @@ class Scheduler:
                     )
                 )
 
+        # --- phase 2: choose WHEN to do it, by time of day ---
+        # Tasks with a preferred time are anchored first so they keep their
+        # slot; everything else then fills the gaps between them, earliest
+        # first. Without this split a high-priority evening task would push the
+        # whole morning routine into the evening behind it.
+        timed = sorted(
+            [(p, t) for p, t in selected if t.time], key=lambda pt: pt[1].time
+        )
+        untimed = [(p, t) for p, t in selected if not t.time]
+
+        placed: list[tuple[int, int, Pet, Task, str]] = []  # start, end, pet, task, reason
+        used = 0
+
+        for pet, task in timed:
+            preferred = self.parse_time(task.time)
+            start = self._find_slot(task.duration_minutes, preferred, window_end, placed)
+            if start is None:
+                skipped.append(
+                    PlanItem(
+                        task=task, pet=pet, start_time="", included=False,
+                        reason=(
+                            f"wanted {task.time} but no free {task.duration_minutes} min "
+                            f"slot before {self._format_time(window_end)}"
+                        ),
+                    )
+                )
+                continue
+            note = "at its preferred time" if start == preferred else f"moved from {task.time}"
+            placed.append((start, start + task.duration_minutes, pet, task, note))
+            placed.sort(key=lambda entry: entry[0])
+            used += task.duration_minutes
+
+        for pet, task in untimed:
+            start = self._find_slot(task.duration_minutes, window_start, window_end, placed)
+            if start is None:
+                skipped.append(
+                    PlanItem(
+                        task=task, pet=pet, start_time="", included=False,
+                        reason=(
+                            f"no free {task.duration_minutes} min slot before "
+                            f"{self._format_time(window_end)}"
+                        ),
+                    )
+                )
+                continue
+            placed.append((start, start + task.duration_minutes, pet, task, "fitted into a free slot"))
+            placed.sort(key=lambda entry: entry[0])
+            used += task.duration_minutes
+
+        items = [
+            PlanItem(
+                task=task,
+                pet=pet,
+                start_time=self._format_time(start),
+                included=True,
+                reason=f"{task.priority.value} priority, {note}",
+            )
+            for start, _end, pet, task, note in placed
+        ]
+
         return DailyPlan(owner=owner, items=items, skipped=skipped, total_minutes=used)
+
+    @staticmethod
+    def _find_slot(
+        duration: int,
+        earliest: int,
+        window_end: int,
+        placed: list[tuple[int, int, Pet, Task, str]],
+    ) -> int | None:
+        """Return the first free start time for a task, or None if it can't fit.
+
+        Walks the already-placed tasks in chronological order looking for a gap
+        wide enough, never starting before `earliest` and never finishing after
+        `window_end`.
+
+        Args:
+            duration: how many minutes the task needs.
+            earliest: the earliest acceptable start, in minutes since midnight.
+            window_end: the owner's cutoff, in minutes since midnight.
+            placed: already-scheduled (start, end, pet, task, note) entries,
+                sorted by start.
+
+        Returns:
+            Minutes since midnight for the start, or None if nothing fits.
+        """
+        cursor = earliest
+        for start, end, *_ in placed:
+            if end <= cursor:
+                continue  # already behind us
+            if cursor + duration <= start:
+                return cursor  # fits in the gap before this task
+            cursor = max(cursor, end)
+        return cursor if cursor + duration <= window_end else None
+
+    @staticmethod
+    def parse_time(value: str) -> int:
+        """Convert an 'HH:MM' string to minutes since midnight (0 if unparseable)."""
+        try:
+            hours, minutes = value.split(":")
+            return int(hours) * 60 + int(minutes)
+        except (ValueError, AttributeError):
+            return 0
 
     def _collect_tasks(self, owner: Owner) -> list[tuple[Pet, Task]]:
         """Flatten every (pet, task) pair across all of the owner's pets."""
