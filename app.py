@@ -179,7 +179,7 @@ if owner.pets:
 
             if pet.tasks:
                 for idx, t in enumerate(pet.tasks):
-                    r1, r2, r3 = st.columns([5, 3, 2])
+                    r1, r2, r3, r4 = st.columns([5, 3, 1.6, 1])
                     done = t.status == "complete"
                     title = f"~~{t.title}~~" if done else t.title
                     r1.markdown(f"{'✅' if done else '⬜'} {title}")
@@ -196,6 +196,12 @@ if owner.pets:
                         nxt = pet.complete_task(t)
                         if nxt is not None:
                             st.toast(f"Next {t.title} scheduled for {nxt.due_date}")
+                        st.rerun()
+                    if r4.button("🗑️", key=f"remove_{pet.name}_{idx}", help="Remove this task"):
+                        # pop by index rather than pet.tasks.remove(t): direct,
+                        # and doesn't rely on Task's default identity equality.
+                        removed = pet.tasks.pop(idx)
+                        st.toast(f"Removed '{removed.title}'.")
                         st.rerun()
 
                     # --- edit ("fix") an already-added task ----------------
