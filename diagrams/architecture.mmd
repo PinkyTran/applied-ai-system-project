@@ -1,0 +1,36 @@
+%% System Architecture — Applied AI System Project
+%% Edit the nodes/labels below to match your actual system.
+%% Preview: https://mermaid.live  (paste this file's contents, then export PNG to ../assets/)
+
+flowchart TD
+    User([User])
+
+    subgraph Client["Client Layer"]
+        UI[Web UI / CLI]
+    end
+
+    subgraph Backend["Application Layer"]
+        API[API Server]
+        Orchestrator[Agent / Orchestration Logic]
+    end
+
+    subgraph AI["AI Layer"]
+        LLM[Claude API<br/>claude-opus-5]
+        Tools[Tools / Function Calling]
+    end
+
+    subgraph Data["Data Layer"]
+        VectorDB[(Vector Store)]
+        DB[(Database)]
+    end
+
+    User --> UI
+    UI --> API
+    API --> Orchestrator
+    Orchestrator --> LLM
+    Orchestrator --> Tools
+    Orchestrator --> VectorDB
+    Orchestrator --> DB
+    LLM --> Orchestrator
+    Orchestrator --> API
+    API --> UI
