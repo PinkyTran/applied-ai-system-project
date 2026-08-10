@@ -96,7 +96,7 @@ safely defaults to the free path instead of failing with a confusing 401.
 python -m pytest
 ```
 
-132 tests, all offline and free — the AI tests inject a fake client (and, for
+141 tests, all offline and free — the AI tests inject a fake client (and, for
 the Ollama path, a fake HTTP response), so the suite needs no API key, no
 running Ollama server, and no network call.
 
@@ -188,6 +188,32 @@ Nothing reaches the domain model without passing every check:
 
 Rejections are shown in the UI with a 🛡️ marker, so you can see what the system
 threw away and why rather than silently trusting it.
+
+### Getting a full routine, not one task
+
+Smaller models — especially the local one — can undershoot: asked for a day's
+routine, they sometimes return a single task and stop, even when told
+explicitly to cover the whole day. Two layers fix this:
+
+1. **The prompt asks for a specific minimum.** `SYSTEM_PROMPT` requires at
+   least `MIN_TASKS_REQUESTED` (4) tasks whenever the sources support it, and
+   names the categories to cover — feeding, toileting, exercise, medication,
+   grooming — instead of leaving "propose some tasks" open to a one-item
+   answer.
+2. **A one-shot top-up call is the safety net.** If fewer than
+   `MIN_ACCEPTED_TASKS` (3) tasks survive validation, `suggest_tasks()`
+   automatically sends one follow-up request — `build_topup_prompt()` lists
+   what was already accepted and asks the model to add to it rather than
+   repeat it, so the retry isn't just a byte-for-byte rerun of the same
+   prompt (which would return the same short answer, since the local
+   backend runs at `temperature: 0` for reproducibility). Results from both
+   calls are merged, deduplicated by title, and capped at `MAX_TASKS`. If the
+   top-up call itself fails, the first call's tasks are kept rather than
+   losing everything.
+
+This only ever fires **once** per suggestion — it's a correction for a weak
+first answer, not a loop chasing a target count. Token usage from both calls
+is added together and shown in the UI, so a top-up isn't hidden cost.
 
 ### Error handling
 
@@ -311,7 +337,7 @@ while `Task.next_occurrence()` does the pure date math. A `once` task returns
 ## 🧪 Tests
 
 ```bash
-python -m pytest                     # all 132
+python -m pytest                     # all 141
 python -m pytest tests/test_rag.py   # just the AI layer
 ```
 
@@ -327,7 +353,7 @@ without disturbing anchored ones, tasks are rejected when they'd finish after
 independent limits, and an owner with no window falls back to the original
 back-to-back behaviour unchanged.
 
-`tests/test_rag.py` (90 tests) covers the AI layer:
+`tests/test_rag.py` (99 tests) covers the AI layer:
 
 - **Tokenizer & knowledge loading** — lowercasing, stopwords, singularisation
   edge cases; titles/tags parsed correctly; a missing *or empty* knowledge
@@ -353,6 +379,13 @@ back-to-back behaviour unchanged.
   server, a missing model, and an off-schema reply each become a specific,
   actionable message rather than a crash — all via a mocked HTTP layer, so no
   server needs to be running for the suite to pass.
+- **Top-up on a short first answer** — a too-short response triggers exactly
+  one follow-up call, on both backends; the second prompt is verified to
+  actually differ from the first (not a no-op retry at `temperature: 0`);
+  results merge and dedupe correctly; the merge respects `MAX_TASKS`; and a
+  failed top-up keeps the first call's partial result instead of raising. One
+  test disables the trigger and confirms 5 of these fail — proof the suite
+  would actually catch this bug coming back.
 - **End to end** — on both backends: suggestions flow into `Scheduler` and come
   back correctly scheduled and skipped, refusals and API errors become
   friendly messages, a missing key on the Anthropic path fails before any

@@ -25,6 +25,7 @@ from pawpal_ai import (
     CarePlanSuggestion,
     PawPalAIError,
     ProposedTask,
+    SuggestedTask,
     SuggestionResult,
     _validate,
     build_user_prompt,
@@ -345,33 +346,57 @@ def test_one_bad_proposal_does_not_discard_the_good_ones(kb):
 
 
 class FakeMessages:
-    """Stands in for client.messages, returning a canned parsed response."""
+    """Stands in for client.messages, returning a canned parsed response.
 
-    def __init__(self, suggestion: CarePlanSuggestion, stop_reason: str = "end_turn"):
-        self.suggestion = suggestion
+    Accepts either one CarePlanSuggestion (returned on every call — the common
+    case) or a list of them, consumed one per call so a test can script a
+    top-up scenario: a short first answer, then a fuller second one. The list
+    form is exhausted at its last element rather than raising, so an
+    unexpectedly-triggered extra call doesn't crash the test.
+    """
+
+    def __init__(
+        self,
+        suggestion: CarePlanSuggestion | list[CarePlanSuggestion],
+        stop_reason: str = "end_turn",
+    ):
+        self.suggestions = suggestion if isinstance(suggestion, list) else [suggestion]
         self.stop_reason = stop_reason
         self.last_kwargs: dict = {}
+        self.all_kwargs: list[dict] = []  # every call, for asserting the top-up prompt differs
+        self.call_count = 0
 
     def parse(self, **kwargs):
         self.last_kwargs = kwargs
+        self.all_kwargs.append(kwargs)
+        index = min(self.call_count, len(self.suggestions) - 1)
+        self.call_count += 1
         return SimpleNamespace(
-            parsed_output=self.suggestion,
+            parsed_output=self.suggestions[index],
             stop_reason=self.stop_reason,
             usage=SimpleNamespace(input_tokens=1234, output_tokens=567),
         )
 
 
 class FakeClient:
-    def __init__(self, suggestion: CarePlanSuggestion, stop_reason: str = "end_turn"):
+    def __init__(
+        self,
+        suggestion: CarePlanSuggestion | list[CarePlanSuggestion],
+        stop_reason: str = "end_turn",
+    ):
         self.messages = FakeMessages(suggestion, stop_reason)
 
 
 def test_suggest_tasks_end_to_end(kb, owner):
+    # Three good proposals clears MIN_ACCEPTED_TASKS, so this exercises a
+    # single call — the top-up path has its own dedicated tests below.
     pet = Pet(name="Biscuit", species="dog", breed="labrador", age=4)
     owner.add_pet(pet)
     suggestion = CarePlanSuggestion(
         tasks=[
             make_proposal(title="Morning walk", source_id="dog-walking"),
+            make_proposal(title="Evening walk", source_id="dog-walking", time="18:00"),
+            make_proposal(title="Potty break", source_id="dog-walking", time=""),
             make_proposal(title="Hallucinated chore", source_id="rabbit-care"),
         ],
         coverage_note="Grooming left out for time.",
@@ -380,10 +405,13 @@ def test_suggest_tasks_end_to_end(kb, owner):
 
     result = suggest_tasks(pet, owner, kb=kb, client=client)
 
-    assert [s.task.title for s in result.suggestions] == ["Morning walk"]
+    assert [s.task.title for s in result.suggestions] == [
+        "Morning walk", "Evening walk", "Potty break",
+    ]
     assert len(result.rejected) == 1
     assert result.coverage_note == "Grooming left out for time."
     assert result.input_tokens == 1234 and result.output_tokens == 567
+    assert client.messages.call_count == 1  # sufficient on the first try
     # The sources actually retrieved must be reported back for the UI to cite.
     assert "dog-walking" in [c.id for c in result.sources]
 
@@ -465,6 +493,227 @@ def test_missing_api_key_falls_back_to_the_free_local_backend(kb, owner, monkeyp
 
     assert result.provider == "ollama"
     assert called["model"] == pawpal_ai.DEFAULT_OLLAMA_MODEL
+
+
+# --- top-up: recovering from a too-short first response --------------------
+#
+# The bug this section covers: a model — especially a small local one — would
+# sometimes propose just one task despite the prompt asking for a full day's
+# routine, and the app had no way to notice or correct that. These tests
+# exercise the fix (a single, automatic follow-up call) directly.
+
+
+def test_build_topup_prompt_lists_whats_already_covered(kb, owner):
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    accepted = [
+        SuggestedTask(
+            task=Task("Morning walk", 20, Priority.HIGH),
+            source_id="dog-walking", source_title="Daily walking for adult dogs",
+            rationale="r",
+        )
+    ]
+    prompt = pawpal_ai.build_topup_prompt(
+        pet, owner, kb.search("dog walking", top_k=2), accepted
+    )
+    assert "Morning walk" in prompt
+    assert str(pawpal_ai.MIN_TASKS_REQUESTED) in prompt
+    assert "do not repeat" in prompt.lower()
+
+
+def test_build_topup_prompt_with_nothing_accepted_yet(kb, owner):
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    prompt = pawpal_ai.build_topup_prompt(pet, owner, kb.search("dog walking", top_k=2), [])
+    assert "none yet" in prompt
+
+
+def test_topup_triggers_and_merges_when_first_response_is_too_short(kb, owner):
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    first = CarePlanSuggestion(
+        tasks=[make_proposal(title="Morning walk", source_id="dog-walking")],
+        coverage_note="short first answer",
+    )
+    second = CarePlanSuggestion(
+        tasks=[
+            make_proposal(title="Evening walk", source_id="dog-walking", time="18:00"),
+            make_proposal(title="Morning meal", source_id="dog-feeding", time="07:00"),
+            make_proposal(title="Evening meal", source_id="dog-feeding", time="19:00"),
+        ],
+        coverage_note="fuller answer",
+    )
+    client = FakeClient([first, second])
+
+    result = suggest_tasks(pet, owner, kb=kb, client=client)
+
+    assert client.messages.call_count == 2  # the fix: a second call happened
+    assert [s.task.title for s in result.suggestions] == [
+        "Morning walk", "Evening walk", "Morning meal", "Evening meal",
+    ]
+    # Token usage from both calls is reported, not just the first.
+    assert result.input_tokens == 1234 * 2
+    assert result.output_tokens == 567 * 2
+    # The second call's coverage note is the more informative, final one.
+    assert result.coverage_note == "fuller answer"
+
+
+def test_topup_second_prompt_is_not_a_byte_for_byte_repeat(kb, owner):
+    # A local model runs at temperature 0 (see _generate_ollama); retrying with
+    # an identical prompt would deterministically reproduce the same short
+    # answer. The fix only works if the second prompt actually differs.
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    first = CarePlanSuggestion(
+        tasks=[make_proposal(title="Morning walk", source_id="dog-walking")],
+        coverage_note="",
+    )
+    client = FakeClient([first, first])
+
+    suggest_tasks(pet, owner, kb=kb, client=client)
+
+    assert client.messages.call_count == 2
+    first_prompt = client.messages.all_kwargs[0]["messages"][0]["content"]
+    second_prompt = client.messages.all_kwargs[1]["messages"][0]["content"]
+    assert first_prompt != second_prompt
+    assert "Morning walk" in second_prompt  # names what's already covered
+
+
+def test_topup_not_triggered_when_first_response_is_already_sufficient(kb, owner):
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    suggestion = CarePlanSuggestion(
+        tasks=[
+            make_proposal(title="Morning walk", source_id="dog-walking"),
+            make_proposal(title="Evening walk", source_id="dog-walking", time="18:00"),
+            make_proposal(title="Morning meal", source_id="dog-feeding", time="07:00"),
+        ],
+        coverage_note="",
+    )
+    client = FakeClient(suggestion)
+
+    result = suggest_tasks(pet, owner, kb=kb, client=client)
+
+    assert client.messages.call_count == 1  # no wasted second call
+    assert len(result.suggestions) == 3
+
+
+def test_topup_duplicate_reproposal_is_rejected_not_double_counted(kb, owner):
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    first = CarePlanSuggestion(
+        tasks=[make_proposal(title="Morning walk", source_id="dog-walking")],
+        coverage_note="",
+    )
+    second = CarePlanSuggestion(
+        tasks=[
+            make_proposal(title="Morning walk", source_id="dog-walking"),  # re-proposed
+            make_proposal(title="Evening walk", source_id="dog-walking", time="18:00"),
+        ],
+        coverage_note="",
+    )
+    client = FakeClient([first, second])
+
+    result = suggest_tasks(pet, owner, kb=kb, client=client)
+
+    assert [s.task.title for s in result.suggestions] == ["Morning walk", "Evening walk"]
+    assert any("duplicate" in r for r in result.rejected)
+
+
+def test_topup_merge_is_capped_at_max_tasks(kb, owner):
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    first = CarePlanSuggestion(
+        tasks=[
+            make_proposal(title="Task A", source_id="dog-walking"),
+            make_proposal(title="Task B", source_id="dog-walking"),
+        ],
+        coverage_note="",
+    )
+    second = CarePlanSuggestion(
+        tasks=[
+            make_proposal(title=f"Task {c}", source_id="dog-walking")
+            for c in "CDEFGHI"  # 7 more — 2 + 7 = 9, over MAX_TASKS
+        ],
+        coverage_note="",
+    )
+    client = FakeClient([first, second])
+
+    result = suggest_tasks(pet, owner, kb=kb, client=client)
+
+    assert len(result.suggestions) == pawpal_ai.MAX_TASKS
+
+
+def test_topup_failure_keeps_the_first_calls_partial_result(kb, owner):
+    import anthropic
+
+    class FlakyMessages:
+        """First call succeeds; anything after that fails."""
+
+        def __init__(self, suggestion):
+            self.suggestion = suggestion
+            self.call_count = 0
+
+        def parse(self, **kwargs):
+            self.call_count += 1
+            if self.call_count > 1:
+                raise anthropic.APIConnectionError(request=SimpleNamespace())
+            return SimpleNamespace(
+                parsed_output=self.suggestion,
+                stop_reason="end_turn",
+                usage=SimpleNamespace(input_tokens=100, output_tokens=50),
+            )
+
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+    suggestion = CarePlanSuggestion(
+        tasks=[make_proposal(title="Morning walk", source_id="dog-walking")],
+        coverage_note="",
+    )
+    client = SimpleNamespace(messages=FlakyMessages(suggestion))
+
+    # Must not raise — a failed top-up degrades to the partial result instead
+    # of losing the one good task the first call already produced.
+    result = suggest_tasks(pet, owner, kb=kb, client=client)
+
+    assert [s.task.title for s in result.suggestions] == ["Morning walk"]
+    assert result.input_tokens == 100
+    assert result.output_tokens == 50
+
+
+def test_ollama_topup_extends_a_short_first_response(kb, owner, monkeypatch):
+    """The mechanism is provider-agnostic — this is the path your bug hit."""
+    first_reply = {
+        "message": {"content": CarePlanSuggestion(
+            tasks=[make_proposal(title="Morning walk", source_id="dog-walking")],
+            coverage_note="",
+        ).model_dump_json()},
+        "prompt_eval_count": 10, "eval_count": 20,
+    }
+    second_reply = {
+        "message": {"content": CarePlanSuggestion(
+            tasks=[
+                make_proposal(title="Evening walk", source_id="dog-walking", time="18:00"),
+                make_proposal(title="Morning meal", source_id="dog-feeding", time="07:00"),
+            ],
+            coverage_note="",
+        ).model_dump_json()},
+        "prompt_eval_count": 15, "eval_count": 25,
+    }
+    replies = iter([first_reply, second_reply])
+    monkeypatch.setattr(
+        pawpal_ai.urllib.request, "urlopen",
+        lambda *a, **k: fake_ollama_response(next(replies)),
+    )
+    pet = Pet(name="Biscuit", species="dog", age=4)
+    owner.add_pet(pet)
+
+    result = suggest_tasks(pet, owner, kb=kb, provider="ollama")
+
+    assert [s.task.title for s in result.suggestions] == [
+        "Morning walk", "Evening walk", "Morning meal",
+    ]
+    assert result.input_tokens == 25 and result.output_tokens == 45
 
 
 def test_no_retrieval_hits_returns_empty_without_calling_the_api(kb, owner, monkeypatch):
@@ -729,11 +978,16 @@ def test_end_to_end_evening_task_lands_in_the_evening(kb, owner):
         ],
         coverage_note="",
     )
-    result = suggest_tasks(pet, owner, kb=kb, client=FakeClient(suggestion))
+    client = FakeClient(suggestion)
+    result = suggest_tasks(pet, owner, kb=kb, client=client)
     by_title = {s.task.title: s.task.time for s in result.suggestions}
     assert Scheduler.parse_time(by_title["Evening walk"]) > Scheduler.parse_time(
         by_title["Morning walk"]
     )
+    # Only 2 accepted tasks is below MIN_ACCEPTED_TASKS, so this also fires the
+    # top-up call — its re-proposal of the same two titles is correctly
+    # rejected as duplicates, leaving the accepted set unchanged either way.
+    assert client.messages.call_count == 2
 
 
 # --- ollama backend (no server needed) ------------------------------------
@@ -808,6 +1062,8 @@ def test_ollama_path_runs_the_same_guardrails(kb, owner, monkeypatch):
             "content": CarePlanSuggestion(
                 tasks=[
                     make_proposal(title="Morning walk", source_id="dog-walking"),
+                    make_proposal(title="Evening walk", source_id="dog-walking", time="18:00"),
+                    make_proposal(title="Potty break", source_id="dog-walking", time=""),
                     make_proposal(title="Bogus", source_id="invented-source"),
                 ],
                 coverage_note="",
@@ -824,7 +1080,9 @@ def test_ollama_path_runs_the_same_guardrails(kb, owner, monkeypatch):
 
     result = suggest_tasks(pet, owner, kb=kb, provider="ollama")
 
-    assert [s.task.title for s in result.suggestions] == ["Morning walk"]
+    assert [s.task.title for s in result.suggestions] == [
+        "Morning walk", "Evening walk", "Potty break",
+    ]
     assert len(result.rejected) == 1
     assert result.provider == "ollama"
 

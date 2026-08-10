@@ -54,6 +54,8 @@ OLLAMA_TIMEOUT = 300  # local generation is slower than an API call
 
 # --- guardrail limits ------------------------------------------------------
 MAX_TASKS = 8  # a day's plan longer than this is unusable, not helpful
+MIN_TASKS_REQUESTED = 4  # ask the model for a full day's routine, not one item
+MIN_ACCEPTED_TASKS = 3  # below this, ask the model for more before returning
 MIN_DURATION = 1
 MAX_DURATION = 240  # 4 hours; anything longer is a model error, not a chore
 MAX_TITLE_LEN = 60
@@ -61,12 +63,24 @@ TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 PRIORITY_ENUM = {"high": Priority.HIGH, "medium": Priority.MEDIUM, "low": Priority.LOW}
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = f"""\
 You are the care-planning assistant inside PawPal+, an app that builds a pet \
 owner's daily care schedule.
 
 You will be given a pet profile, the owner's daily time budget, and a set of \
 numbered care guidance sources retrieved from PawPal+'s knowledge base.
+
+How many tasks to propose:
+- Propose a FULL day's routine, not a single task. That means at least \
+{MIN_TASKS_REQUESTED} separate tasks whenever the sources support it — a plan \
+with only one task is almost always wrong.
+- Cover every relevant category the sources mention for this pet: feeding \
+(every meal of the day, not just one), toileting or litter care, exercise, \
+medication if applicable, and grooming or enrichment if time allows. Each \
+category becomes its own task, not a footnote inside another one.
+- Only propose fewer tasks than that if the owner's time budget genuinely \
+cannot fit more, or the retrieved sources truly do not cover more ground — and \
+say why in coverage_note when that happens.
 
 Rules:
 - Base every task on the retrieved sources. Do not use pet-care knowledge that \
@@ -140,7 +154,12 @@ class ProposedTask(BaseModel):
 class CarePlanSuggestion(BaseModel):
     """The model's full response for one pet."""
 
-    tasks: list[ProposedTask]
+    tasks: list[ProposedTask] = Field(
+        description=(
+            f"A full day's routine: at least {MIN_TASKS_REQUESTED} tasks whenever "
+            "the sources and time budget allow it. Do not stop at one task."
+        )
+    )
     coverage_note: str = Field(
         description="What the sources did not cover, or what was left out for time."
     )
@@ -344,6 +363,38 @@ def build_user_prompt(pet: Pet, owner: Owner, chunks: list[Chunk]) -> str:
         + format_sources(chunks)
         + "\n\nPropose the daily care tasks for this pet, grounded in the sources above. "
         "Do not repeat a task the owner has already added."
+    )
+
+
+def build_topup_prompt(
+    pet: Pet, owner: Owner, chunks: list[Chunk], already: list[SuggestedTask]
+) -> str:
+    """Build a follow-up prompt asking the model to extend a too-short plan.
+
+    Used when the first response under-delivered — smaller models, especially
+    ones running locally, sometimes stop after a single task despite being
+    told to cover the whole day. Lists what was already accepted so the model
+    adds to the routine instead of repeating it, and restates the sources so
+    the requirement isn't lost.
+
+    Args:
+        pet: the pet being planned for.
+        owner: the pet's owner.
+        chunks: the sources retrieved for this pet.
+        already: tasks accepted from the first response.
+
+    Returns:
+        A user-turn prompt for a second, independent generation call.
+    """
+    covered = ", ".join(s.task.title for s in already) or "none yet"
+    return (
+        build_user_prompt(pet, owner, chunks)
+        + "\n\nYour previous answer only proposed a partial routine. Tasks "
+        f"already decided: {covered}. Propose MORE tasks that fill out the "
+        "rest of the day using the sources above — do not repeat any task in "
+        f"that list. Aim for a full routine of at least {MIN_TASKS_REQUESTED} "
+        "tasks in total, covering feeding, toileting, exercise, medication and "
+        "grooming wherever the sources support it."
     )
 
 
@@ -652,6 +703,7 @@ def suggest_tasks(
         existing_titles={t.title.strip().lower() for t in pet.tasks},
         owner=owner,
     )
+    coverage_note = parsed.coverage_note.strip()
 
     logger.info(
         "Pet %s: %d proposed -> %d accepted, %d rejected (tokens in=%d out=%d)",
@@ -660,10 +712,58 @@ def suggest_tasks(
     for reason in rejected:
         logger.warning("Rejected: %s", reason)
 
+    # Small models — especially local ones — sometimes stop after a single
+    # task despite being told to cover the whole day (see MIN_TASKS_REQUESTED
+    # in the prompt). One top-up call, with an amended prompt so it isn't a
+    # deterministic repeat of the first answer, turns that into a full
+    # routine instead of shipping a near-empty plan. Only one attempt: this
+    # is a recovery for a weak first answer, not a loop chasing a target count.
+    if len(accepted) < MIN_ACCEPTED_TASKS:
+        logger.info(
+            "Only %d task(s) accepted for %s; requesting a fuller routine",
+            len(accepted), pet.name,
+        )
+        topup_user = build_topup_prompt(pet, owner, chunks, accepted)
+        try:
+            if provider == PROVIDER_OLLAMA:
+                topup_parsed, topup_in, topup_out = _generate_ollama(system, topup_user, model)
+            else:
+                topup_parsed, topup_in, topup_out = _generate_anthropic(
+                    system, topup_user, model, client
+                )
+        except PawPalAIError as exc:
+            # The first answer is still good — keep it rather than failing
+            # the whole request over a top-up that didn't go through.
+            logger.warning("Top-up request failed, keeping the partial result: %s", exc)
+        else:
+            topup_accepted, topup_rejected = _validate(
+                proposals=topup_parsed.tasks,
+                allowed_ids={c.id: c for c in chunks},
+                existing_titles=(
+                    {t.title.strip().lower() for t in pet.tasks}
+                    | {s.task.title.strip().lower() for s in accepted}
+                ),
+                owner=owner,
+            )
+            logger.info(
+                "Top-up for %s: %d proposed -> %d accepted, %d rejected (tokens in=%d out=%d)",
+                pet.name, len(topup_parsed.tasks), len(topup_accepted), len(topup_rejected),
+                topup_in, topup_out,
+            )
+            for reason in topup_rejected:
+                logger.warning("Rejected (top-up): %s", reason)
+
+            accepted = (accepted + topup_accepted)[:MAX_TASKS]
+            rejected = rejected + topup_rejected
+            in_tokens += topup_in
+            out_tokens += topup_out
+            if topup_parsed.coverage_note.strip():
+                coverage_note = topup_parsed.coverage_note.strip()
+
     return SuggestionResult(
         suggestions=accepted,
         sources=chunks,
-        coverage_note=parsed.coverage_note.strip(),
+        coverage_note=coverage_note,
         rejected=rejected,
         input_tokens=in_tokens,
         output_tokens=out_tokens,

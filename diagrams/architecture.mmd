@@ -13,7 +13,7 @@
 %% AI results are checked in three places, labelled CHECK A/B/C below:
 %%   CHECK A  _validate() guardrails - automated, every run, blocks bad output
 %%   CHECK B  Human review in the UI - owner ticks/unticks before anything is kept
-%%   CHECK C  pytest suite           - 132 offline tests (fake API client + local Ollama backend)
+%%   CHECK C  pytest suite           - 141 offline tests (fake API client + local Ollama backend)
 
 flowchart TD
 
@@ -49,6 +49,7 @@ flowchart TD
         Bounds{"duration 1-240 · valid enums<br/>no duplicates · max 8 tasks"}
         Infer["infer_time_of_day()<br/>blank time -> guess from title,<br/>e.g. 'Evening walk' -> late in the window"]
         Reject["Rejected and logged<br/>reason shown in the UI"]
+        TooFew{"Fewer than<br/>MIN_ACCEPTED_TASKS<br/>survived?"}
         Review["CHECK B · Human review<br/>owner ticks or unticks each task"]
     end
 
@@ -68,9 +69,9 @@ flowchart TD
         Log[("pawpal.log<br/>retrieval scores · accept and reject · tokens")]
     end
 
-    subgraph Testing["CHECK C · TESTING · pytest · 132 tests, all offline"]
+    subgraph Testing["CHECK C · TESTING · pytest · 141 tests, all offline"]
         Fake["FakeClient<br/>replaces the Claude API"]
-        TestRag["tests/test_rag.py · 90 tests<br/>retrieval, guardrails, time inference, both backends"]
+        TestRag["tests/test_rag.py · 99 tests<br/>retrieval, guardrails, time inference,<br/>top-up loop, both backends"]
         TestDom["tests/test_pawpal.py · 42 tests<br/>scheduling behaviour, incl. the availability window"]
     end
 
@@ -98,7 +99,9 @@ flowchart TD
     Ground -->|grounded| Bounds
     Bounds -->|fails a rule| Reject
     Bounds -->|passes| Infer
-    Infer --> Review
+    Infer --> TooFew
+    TooFew -->|no| Review
+    TooFew -.->|"yes (once) — build_topup_prompt()<br/>lists what's covered, asks for more"| Prompt
 
     Review -->|kept| Accepted
     Review -->|unticked| Discard["Discarded"]
@@ -132,6 +135,6 @@ flowchart TD
     class Owner,Review human
     class Local,Cloud,Proposed ai
     class Pick check
-    class Guard,Ground,Bounds,Infer,TestRag,TestDom,Fake check
+    class Guard,Ground,Bounds,Infer,TooFew,TestRag,TestDom,Fake check
     class Reject,Discard bad
     class KB,Log store
