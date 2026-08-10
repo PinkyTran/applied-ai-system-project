@@ -157,62 +157,167 @@ filtering, recurring tasks — with no AI involved.
 
 ## Sample interactions
 
-Three real runs from this project's development, verbatim from the app
-(times below are placements chosen by the Scheduler; sources are what the
-Generator actually cited). Model: `llama3.2:3b` via Ollama, the free backend.
+Three complete runs, captured live and unedited against the free local
+backend (`ollama/llama3.2:3b`) while writing this README. Each one is run
+**end to end** — pet profile in, through retrieval, generation, the
+evaluator's guardrail checks, and the Scheduler's final plan — with nothing
+skipped or cleaned up. `pawpal.log` (gitignored, since it's local runtime
+data that grows with every run) is where the exact log lines quoted below
+came from; run the app yourself and you'll see the same kind of output for
+your own pets.
 
-### 1. A labrador, no special constraints
+### 1. A labrador with a pre-existing task — the guardrail catches a real duplicate
 
-**Input:** species `dog`, breed `labrador`, age `4`, budget `120 min`, window
-`07:00`–`20:00`.
+**Input:** species `dog`, breed `labrador`, age `4`, budget `60 min`, window
+`07:00`–`20:00`. The owner had already manually added **"Morning walk" (30
+min, high)** before asking for AI suggestions.
 
-**Output** (8 tasks, all grounded):
+**AI suggestion** — `ollama/llama3.2:3b`, 38s, 1694 in / 735 out tokens.
+Sources retrieved: `dog-walking`, `dog-grooming`, `dog-feeding`,
+`time-budget-triage`.
 
 | Time | Task | Min | Priority | Source |
 |---|---|---|---|---|
-| 08:15 | Morning walk | 30 | high | `dog-walking` |
 | 08:15 | Morning meal | 10 | high | `dog-feeding` |
+| — | Medication (if applicable) | 5 | high | `dog-feeding` |
 | — | Potty break ×3 | 5 each | medium | `dog-walking` |
 | 14:45 | Afternoon meal | 10 | high | `dog-feeding` |
 | 18:00 | Evening walk | 30 | high | `dog-walking` |
+| — | Grooming (brushing) | 15 | medium | `dog-grooming` |
 
-Sample rationale, taken directly from the model's output for the first task:
-*"Most healthy adult dogs need 30 to 60 minutes of walking per day, usually
-split across two outings so the dog is not holding its bladder for long
-stretches."* — a paraphrase of `knowledge/dog-walking.md`, not the model's own
-claim.
+**Rejected by the evaluator (1):**
+> ⛔ `'Morning walk' was dropped: duplicate of an existing task.`
 
-### 2. A pug — the retrieval genuinely changes the plan
+The model proposed a second "Morning walk" without knowing the owner had
+already added one — `_validate()` caught it and dropped it before it ever
+reached the schedule, exactly as designed.
 
-**Input:** species `dog`, breed `pug`, age `3`, same budget and window.
+**Final schedule** — `Scheduler.build_plan()`, 60/60 min used:
 
-**Output** (4 tasks):
+```
+07:00  Medication (if applicable)    5min — high priority, fitted into a free slot
+07:05  Morning walk                 30min — high priority, fitted into a free slot
+07:35  Potty break 1                 5min — medium priority, fitted into a free slot
+08:15  Morning meal                 10min — high priority, at its preferred time
+14:45  Afternoon meal               10min — high priority, at its preferred time
+
+Skipped (ran out of budget):
+  Evening walk           — needs 30 min but only 5 min left
+  Potty break 2           — needs 5 min but only 0 min left
+  Potty break 3           — needs 5 min but only 0 min left
+  Grooming (brushing)     — needs 15 min but only 0 min left
+```
+
+A 60-minute budget genuinely can't fit everything a dog needs in a day — the
+scheduler says so explicitly rather than silently dropping tasks.
+
+### 2. A pug — retrieval changes the plan, and a live self-correction retry fires
+
+**Input:** species `dog`, breed `pug`, age `3`, budget `120 min`, window
+`07:00`–`20:00`.
+
+**AI suggestion** — first call proposed only **1 task**. The evaluator
+detected this automatically and requested more, unprompted, exactly as it's
+supposed to (real log lines, unedited):
+
+```
+INFO  Pet Nugget: 1 proposed -> 1 accepted, 0 rejected
+INFO  Only 1 task(s) accepted for Nugget; requesting a fuller routine
+INFO  Top-up for Nugget: 9 proposed -> 7 accepted, 2 rejected
+```
+
+Combined result after the retry — 44s total, 3409 in / 847 out tokens.
+Sources retrieved: `dog-walking`, `dog-feeding`, `flat-faced-breeds`,
+`dog-grooming`.
 
 | Time | Task | Min | Priority | Source |
 |---|---|---|---|---|
-| 08:20 | Morning walk | **15** | high | `dog-walking` |
-| 08:20 | Morning meal | 10 | high | `dog-feeding` |
-| — | Potty break | 5 | medium | `dog-walking` |
-| — | Medication (if applicable) | — | — | — |
+| 08:15 | Morning walk | **15** | high | `dog-walking` |
+| 08:15 | Morning meal | 10 | high | `dog-feeding` |
+| — | Fresh water refill | 2 | medium | `dog-feeding` |
+| — | Potty break (backyard) | 5 | medium | `dog-walking` |
+| — | Medication (if applicable) | 5 | high | `dog-feeding` |
+| — | Grooming (facial skin folds) | 5 | medium | `flat-faced-breeds` |
+| 18:00 | Evening meal | 10 | high | `dog-feeding` |
+| — | Grooming (teeth brushing) | 3 | medium | `dog-grooming` |
 
-The word "pug" pulled `knowledge/flat-faced-breeds.md` into the retrieved
-sources — a chunk explaining that flat-faced breeds can't cool themselves
-efficiently and shouldn't be walked longer than ~15–20 minutes. The labrador
-above got a 30-minute walk from the *identical* code path; the pug didn't,
-because different sources were retrieved for it. That's the RAG feature doing
+**Rejected by the evaluator (2):**
+> ⛔ `'Morning walk' was dropped: duplicate of an existing task.`
+> ⛔ `'Potty break (backyard)' was dropped: duplicate of an existing task.`
+
+Both rejections are the retry re-proposing tasks the first call already got
+accepted — the guardrail caught the overlap and merged the two calls into
+one clean 8-task routine instead of a plan with repeats.
+
+The word "pug" is also what makes this case interesting on its own: it
+pulled `flat-faced-breeds.md` into the retrieved sources, which is why the
+walk is capped at **15 minutes** (flat-faced breeds can't cool themselves
+efficiently) and why there's a facial-fold-cleaning task that no other pet in
+this README gets. The labrador above got a 30-minute walk from the
+*identical* code path — different sources were retrieved, so the model had
+different, breed-specific facts to work from. That's the RAG feature doing
 real work, not decoration.
 
-### 3. A senior cat — species and age both change the routine
+**Final schedule** — 55/120 min used:
 
-**Input:** species `cat`, breed `persian`, age `12`, budget `100 min`, window
+```
+07:00  Medication (if applicable)     5min — high priority, fitted into a free slot
+07:05  Fresh water refill             2min — medium priority, fitted into a free slot
+07:07  Grooming (teeth brushing)      3min — medium priority, fitted into a free slot
+07:10  Potty break (backyard)         5min — medium priority, fitted into a free slot
+07:15  Grooming (facial skin folds)   5min — medium priority, fitted into a free slot
+08:15  Morning meal                  10min — high priority, at its preferred time
+08:25  Morning walk                  15min — high priority, moved from 08:15
+18:00  Evening meal                  10min — high priority, at its preferred time
+```
+
+### 3. A senior cat — species and age both change the routine, plus two more guardrail catches
+
+**Input:** species `cat`, breed `persian`, age `12`, budget `90 min`, window
 `07:00`–`21:00`.
 
-**Output** (8 tasks): morning potty break, morning meal, water refresh, and
-brushing all at 08:20; a litter box scoop with no fixed time; an afternoon
-potty break at 15:20; evening meal and water refresh at 18:50. No walk was
-proposed — cats aren't walked, and the age (12) pulled in
-`knowledge/senior-pets.md` alongside `cat-litter.md`, `cat-grooming.md`, and
-`cat-feeding.md`, none of which mention walking.
+**AI suggestion** — 40s, 1551 in / 799 out tokens. Sources retrieved:
+`senior-pets`, `cat-litter`, `cat-grooming`, `cat-feeding` — no walking source
+at all, because cats don't get one.
+
+| Time | Task | Min | Priority | Source |
+|---|---|---|---|---|
+| 08:20 | Morning potty break | 5 | high | `senior-pets` |
+| 08:20 | Morning meal | 10 | medium | `cat-feeding` |
+| 08:20 | Morning water refreshment | 2 | low | `cat-feeding` |
+| 08:20 | Morning brushing | 10 | medium | `cat-grooming` |
+| — | Scoop litter box | 5 | high | `cat-litter` |
+| 15:20 | Afternoon potty break | 5 | high | `senior-pets` |
+| 18:50 | Evening meal | 10 | medium | `cat-feeding` |
+| 18:50 | Evening water refreshment | 2 | low | `cat-feeding` |
+
+**Rejected by the evaluator (2) — two different rules this time:**
+> ⛔ `'Medication' was dropped: 0 min is outside the allowed 1–240 min range.`
+> ⛔ `'Evening brushing' was dropped: more than 8 tasks proposed.`
+
+The first is a bounds check (a 0-minute task is nonsensical and would crash
+the domain model if it got through); the second is the hard cap that keeps a
+plan from growing past a usable size. Both fired from the model's real,
+unedited output.
+
+**Final schedule** — 49/90 min used, four tasks moved off the same 08:20
+clash the guardrail didn't need to catch (that's the Scheduler's job, not the
+evaluator's — see Design Decisions):
+
+```
+07:00  Scoop litter box               5min — high priority, fitted into a free slot
+08:20  Morning potty break            5min — high priority, at its preferred time
+08:25  Morning meal                  10min — medium priority, moved from 08:20
+08:35  Morning brushing              10min — medium priority, moved from 08:20
+08:45  Morning water refreshment      2min — low priority, moved from 08:20
+15:20  Afternoon potty break          5min — high priority, at its preferred time
+18:50  Evening meal                  10min — medium priority, at its preferred time
+19:00  Evening water refreshment      2min — low priority, moved from 18:50
+```
+
+No walk, no litter-box duplicate with the dog cases, senior-specific potty
+frequency — three different pets, three different grounded plans, from the
+same unmodified code path.
 
 ---
 
