@@ -2,139 +2,145 @@
 %% AI feature: Retrieval-Augmented Generation (RAG)
 %% Preview: https://mermaid.live  (paste this file's contents)
 %%
-%% Read the flow top to bottom:
-%%   INPUT     pet profile + owner's time budget
-%%   RETRIEVE  care guidance for THIS pet (deterministic, offline)
-%%   GENERATE  tasks grounded in the retrieved sources only
-%%   VERIFY    automated guardrails, then a human accept/reject step
-%%   SCHEDULE  the unchanged domain logic
-%%   OUTPUT    daily plan + explanation of every decision
+%% Data flows top to bottom: INPUT -> RETRIEVER -> GENERATOR/AGENT ->
+%% EVALUATOR -> HUMAN REVIEW -> SCHEDULER -> OUTPUT.
 %%
-%% AI results are checked in three places, labelled CHECK A/B/C below:
-%%   CHECK A  _validate() guardrails - automated, every run, blocks bad output
-%%   CHECK B  Human review in the UI - owner ticks/unticks before anything is kept
-%%   CHECK C  pytest suite           - 141 offline tests (fake API client + local Ollama backend)
+%% AI results are checked in THREE distinct ways, colour-coded below:
+%%   green   EVALUATOR   automated, every run   — _validate() guardrails +
+%%                        a self-correction retry when the model under-delivers
+%%   amber   HUMAN       every run               — owner ticks/unticks AI
+%%                        suggestions, and can edit or remove ANY task, any time
+%%   blue    TESTER      dev-time, on demand      — pytest, 141 tests, offline
 
 flowchart TD
 
     Owner(["Pet owner"])
 
-    %% ---------------- 1. INPUT ----------------
-    subgraph Input["1 - INPUT · Streamlit UI · app.py"]
+    %% ---------------- INPUT ----------------
+    subgraph INPUT["INPUT — Streamlit UI · app.py"]
         Profile["Pet profile<br/>species · breed · age"]
-        Budget["Time budget<br/>available_minutes"]
+        Budget["Time budget + availability window<br/>available_minutes, day_start..day_end"]
+        Manual["Manual task control<br/>add · edit · 🗑️ remove — any task, any time"]
     end
 
-    %% ---------------- 2. RETRIEVAL ----------------
-    subgraph Retrieval["2 - RETRIEVER · retriever.py · deterministic, no network"]
+    %% ---------------- RETRIEVER ----------------
+    subgraph RETRIEVER["RETRIEVER — retriever.py · deterministic, offline"]
+        KB[("knowledge/<br/>14 markdown care-guidance files")]
         Query["build_query()<br/>species x4 · breed x2 · life stage"]
-        Index["KnowledgeBase<br/>TF-IDF index"]
-        KB[("knowledge/<br/>14 markdown chunks")]
-        TopK["Top-4 chunks<br/>each with a source id"]
+        Search["TF-IDF KnowledgeBase.search()"]
+        Chunks["Top-4 sources<br/>each with a citable id"]
     end
 
-    %% ---------------- 3. GENERATION ----------------
-    subgraph Generation["3 - GENERATOR · pawpal_ai.py"]
-        Prompt["build_user_prompt()<br/>profile + budget + retrieved sources"]
-        Pick{"PAWPAL_PROVIDER<br/>which backend?"}
-        Local["Ollama · local model<br/>free · no API key · offline"]
-        Cloud["Anthropic API · claude-opus-5<br/>paid · faster"]
-        Proposed["ProposedTask list<br/>each must cite a source id"]
+    %% ---------------- GENERATOR / AGENT ----------------
+    subgraph GENERATOR["GENERATOR / AGENT — pawpal_ai.py"]
+        Prompt["Prompt = pet + budget/window<br/>+ retrieved sources ONLY"]
+        Backend{"PAWPAL_PROVIDER<br/>which backend?"}
+        Ollama["Ollama<br/>local model · free"]
+        Claude["Anthropic API<br/>claude-opus-5 · paid"]
+        Draft["Draft tasks<br/>each cites a source_id + time + rationale"]
     end
 
-    %% ---------------- 4. VERIFICATION ----------------
-    subgraph Verify["4 - VERIFICATION · where AI output gets checked"]
-        Guard["CHECK A · _validate() guardrails"]
-        Ground{"Is the cited source id<br/>one we actually retrieved?"}
-        Bounds{"duration 1-240 · valid enums<br/>no duplicates · max 8 tasks"}
-        Infer["infer_time_of_day()<br/>blank time -> guess from title,<br/>e.g. 'Evening walk' -> late in the window"]
-        Reject["Rejected and logged<br/>reason shown in the UI"]
-        TooFew{"Fewer than<br/>MIN_ACCEPTED_TASKS<br/>survived?"}
-        Review["CHECK B · Human review<br/>owner ticks or unticks each task"]
+    %% ---------------- EVALUATOR ----------------
+    subgraph EVALUATOR["EVALUATOR — _validate() · automated check of AI output"]
+        Grounded{"Was the cited source_id<br/>actually retrieved?"}
+        Rules{"duration 1-240 · known priority/frequency<br/>no duplicates · max 8 tasks"}
+        Bad["Rejected and logged<br/>reason shown in the UI"]
+        Enough{"3+ tasks survived?"}
+        Retry["build_topup_prompt()<br/>ask for more, once — lists what's already covered"]
     end
 
-    %% ---------------- 5. DOMAIN ----------------
-    subgraph Domain["5 - SCHEDULER · pawpal_system.py · deterministic, no AI"]
-        Accepted["Validated Task objects"]
-        Sched["Scheduler.build_plan() — two phases:<br/>1 what: rank by priority, fit the budget<br/>2 when: anchor timed tasks, fill gaps<br/>within owner.day_start .. day_end"]
+    %% ---------------- HUMAN REVIEW ----------------
+    subgraph HUMANCHECK["HUMAN REVIEW — the owner, every run"]
+        TickBox["Tick / untick each suggested task"]
     end
 
-    %% ---------------- 6. OUTPUT ----------------
-    subgraph Output["6 - OUTPUT"]
+    TaskList[("pet.tasks<br/>the shared task list")]
+
+    %% ---------------- SCHEDULER ----------------
+    subgraph SCHEDULER["SCHEDULER — pawpal_system.py · deterministic, no AI"]
+        Pick["Phase 1: rank by priority,<br/>fit the minute budget"]
+        Place["Phase 2: place by time,<br/>inside day_start .. day_end"]
+    end
+
+    %% ---------------- OUTPUT ----------------
+    subgraph OUTPUT["OUTPUT"]
         Plan["DailyPlan<br/>scheduled · skipped · reason for each"]
     end
 
-    %% ---------------- CROSS-CUTTING ----------------
-    subgraph Observe["Observability"]
-        Log[("pawpal.log<br/>retrieval scores · accept and reject · tokens")]
+    %% ---------------- OBSERVABILITY ----------------
+    PLog[("pawpal.log<br/>retrieval scores · accept/reject · tokens")]
+
+    %% ---------------- TESTER ----------------
+    subgraph TESTER["TESTER — pytest · 141 tests · fully offline"]
+        Fake["Fake API client +<br/>mocked Ollama HTTP layer"]
+        Coverage["retrieval quality · guardrails ·<br/>time inference · top-up loop · scheduler window"]
+        Mutation["Mutation check:<br/>disabling the top-up fix fails 5 tests"]
     end
 
-    subgraph Testing["CHECK C · TESTING · pytest · 141 tests, all offline"]
-        Fake["FakeClient<br/>replaces the Claude API"]
-        TestRag["tests/test_rag.py · 99 tests<br/>retrieval, guardrails, time inference,<br/>top-up loop, both backends"]
-        TestDom["tests/test_pawpal.py · 42 tests<br/>scheduling behaviour, incl. the availability window"]
-    end
-
-    %% ---------------- MAIN DATA FLOW ----------------
+    %% ================ MAIN DATA FLOW ================
     Owner --> Profile
     Owner --> Budget
+    Owner --> Manual
+
     Profile --> Query
     Budget --> Query
-    KB --> Index
-    Query --> Index
-    Index --> TopK
+    KB --> Search
+    Query --> Search
+    Search --> Chunks
 
-    TopK --> Prompt
+    Chunks --> Prompt
     Profile --> Prompt
     Budget --> Prompt
-    Prompt --> Pick
-    Pick -->|ollama| Local
-    Pick -->|anthropic| Cloud
-    Local --> Proposed
-    Cloud --> Proposed
+    Prompt --> Backend
+    Backend -->|ollama| Ollama
+    Backend -->|anthropic| Claude
+    Ollama --> Draft
+    Claude --> Draft
 
-    Proposed --> Guard
-    Guard --> Ground
-    Ground -->|ungrounded| Reject
-    Ground -->|grounded| Bounds
-    Bounds -->|fails a rule| Reject
-    Bounds -->|passes| Infer
-    Infer --> TooFew
-    TooFew -->|no| Review
-    TooFew -.->|"yes (once) — build_topup_prompt()<br/>lists what's covered, asks for more"| Prompt
+    Draft --> Grounded
+    Chunks -.->|allowed source ids| Grounded
+    Grounded -->|no| Bad
+    Grounded -->|yes| Rules
+    Rules -->|fails a rule| Bad
+    Rules -->|passes| Enough
+    Enough -->|no, once| Retry
+    Retry -.->|amended prompt| Prompt
+    Enough -->|yes| TickBox
 
-    Review -->|kept| Accepted
-    Review -->|unticked| Discard["Discarded"]
-    Accepted --> Sched
-    Sched --> Plan
+    TickBox -->|kept| TaskList
+    TickBox -->|unticked| Discard["Discarded"]
+    Manual --> TaskList
+
+    TaskList --> Pick
+    Pick --> Place
+    Place --> Plan
     Plan --> Owner
-    Reject --> Owner
+    Bad --> Owner
 
-    %% the grounding check compares against what retrieval actually returned
-    TopK -.->|allowed source ids| Ground
+    %% ---------------- observability ----------------
+    Search -.->|logs| PLog
+    Grounded -.->|logs| PLog
+    Ollama -.->|token usage| PLog
+    Claude -.->|token usage| PLog
 
-    %% observability
-    Index -.->|logs| Log
-    Guard -.->|logs| Log
-    Local -.->|token usage| Log
-    Cloud -.->|token usage| Log
-
-    %% test coverage
-    Fake --> TestRag
-    TestRag -.->|verifies| Index
-    TestRag -.->|verifies| Guard
-    TestDom -.->|verifies| Sched
+    %% ---------------- test coverage ----------------
+    Fake --> Coverage
+    Coverage -.->|verifies| Search
+    Coverage -.->|verifies| Grounded
+    Coverage -.->|verifies| Pick
+    Mutation -.->|proves| Coverage
 
     %% ---------------- STYLING ----------------
     classDef human fill:#fde68a,stroke:#b45309,stroke-width:2px,color:#1c1917
     classDef ai fill:#ddd6fe,stroke:#6d28d9,stroke-width:2px,color:#1c1917
-    classDef check fill:#bbf7d0,stroke:#15803d,stroke-width:2px,color:#1c1917
+    classDef evaluator fill:#bbf7d0,stroke:#15803d,stroke-width:2px,color:#1c1917
+    classDef tester fill:#bfdbfe,stroke:#1d4ed8,stroke-width:2px,color:#1c1917
     classDef bad fill:#fecaca,stroke:#b91c1c,stroke-width:2px,color:#1c1917
     classDef store fill:#e0f2fe,stroke:#0369a1,stroke-width:2px,color:#1c1917
 
-    class Owner,Review human
-    class Local,Cloud,Proposed ai
-    class Pick check
-    class Guard,Ground,Bounds,Infer,TooFew,TestRag,TestDom,Fake check
-    class Reject,Discard bad
-    class KB,Log store
+    class Owner,Manual,TickBox human
+    class Backend,Ollama,Claude,Draft ai
+    class Grounded,Rules,Enough,Retry evaluator
+    class Fake,Coverage,Mutation tester
+    class Bad,Discard bad
+    class KB,PLog,TaskList store
